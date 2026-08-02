@@ -1,0 +1,86 @@
+import os
+import json
+from web3 import Web3
+
+RPC = "https://arc-testnet.drpc.org"
+w3 = Web3(Web3.HTTPProvider(RPC))
+PRIVATE_KEY = os.environ["PRIVATE_KEY"]
+account = w3.eth.account.from_key(PRIVATE_KEY)
+
+INTENT_REGISTRY = "0x3917DF9B70DeAEa7c3fcCa7456F89045Ef024d94"
+ARCDEX = "0x1A142DF560a671c66c361A29a48Ab839Bc9F890E"
+USDC = "0x3600000000000000000000000000000000000000"
+VAULT = "0x6C13dA317B65474299F6fDee02daDd6626Eb2BFe"
+
+REGISTRY_ABI = [
+    {"name": "getPendingCount", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"type": "uint256"}]},
+    {"name": "nextId", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"type": "uint256"}]},
+    {"name": "getIntent", "type": "function", "stateMutability": "view", "inputs": [{"name": "id", "type": "uint256"}], "outputs": [{"components": [{"name": "id", "type": "uint256"}, {"name": "user", "type": "address"}, {"name": "intentType", "type": "uint8"}, {"name": "status", "type": "uint8"}, {"name": "amount", "type": "uint256"}, {"name": "tokenIn", "type": "address"}, {"name": "params", "type": "string"}, {"name": "createdAt", "type": "uint256"}, {"name": "solvedAt", "type": "uint256"}, {"name": "solver", "type": "address"}, {"name": "result", "type": "string"}, {"name": "outputAmount", "type": "uint256"}], "name": "", "type": "tuple"}]},
+    {"name": "startSolving", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "id", "type": "uint256"}], "outputs": []},
+    {"name": "recordSolved", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "id", "type": "uint256"}, {"name": "outputAmount", "type": "uint256"}, {"name": "result", "type": "string"}], "outputs": []},
+    {"name": "recordFailed", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "id", "type": "uint256"}, {"name": "reason", "type": "string"}], "outputs": []},
+]
+
+ARCDEX_ABI = [
+    {"name": "getPrice", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"name": "priceAInB", "type": "uint256"}, {"name": "priceBInA", "type": "uint256"}]},
+    {"name": "getAmountOut", "type": "function", "stateMutability": "view", "inputs": [{"name": "tokenIn", "type": "address"}, {"name": "amountIn", "type": "uint256"}], "outputs": [{"name": "amountOut", "type": "uint256"}]},
+    {"name": "swap", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "tokenIn", "type": "address"}, {"name": "amountIn", "type": "uint256"}, {"name": "minAmountOut", "type": "uint256"}], "outputs": [{"name": "amountOut", "type": "uint256"}]},
+]
+
+ERC20_ABI = [
+    {"name": "approve", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}], "outputs": [{"type": "bool"}]},
+]
+
+VAULT_ABI = [
+    {"name": "deposit", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "assets", "type": "uint256"}, {"name": "receiver", "type": "address"}], "outputs": [{"name": "shares", "type": "uint256"}]},
+]
+
+registry = w3.eth.contract(address=INTENT_REGISTRY, abi=REGISTRY_ABI)
+dex = w3.eth.contract(address=ARCDEX, abi=ARCDEX_ABI)
+usdc_c = w3.eth.contract(address=USDC, abi=ERC20_ABI)
+vault_c = w3.eth.contract(address=VAULT, abi=VAULT_ABI)
+
+def send_tx(fn):
+    tx = fn.build_transaction({
+        "from": account.address,
+        "nonce": w3.eth.get_transaction_count(account.address),
+        "gas": 300000,
+        "gasPrice": w3.eth.gas_price,
+    })
+    signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+    hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    w3.eth.wait_for_transaction_receipt(hash)
+    return hash
+
+total = registry.functions.nextId().call()
+pending = registry.functions.getPendingCount().call()
+print(f"Total: {total} | Pending: {pending}")
+
+if pending == 0:
+    print("No pending intents. Done!")
+    exit(0)
+
+for i in range(total):
+    intent = registry.functions.getIntent(i).call()
+    if intent[3] != 0:
+        continue
+    print(f"Solving intent #{i} type={intent[2]} amount={intent[4]/1e6:.4f}")
+    send_tx(registry.functions.startSolving(i))
+    amount = intent[4]
+    intent_type = intent[2]
+    if intent_type in [0, 1]:
+        send_tx(usdc_c.functions.approve(ARCDEX, amount))
+        amount_out = dex.functions.getAmountOut(USDC, amount).call()
+        send_tx(dex.functions.swap(USDC, amount, 0))
+        result = json.dumps({"strategy": "ARCDEX_SWAP", "outputAmount": amount_out})
+        send_tx(registry.functions.recordSolved(i, amount_out, result))
+    elif intent_type == 2:
+        result = json.dumps({"strategy": "CCTP_BRIDGE", "outputAmount": amount})
+        send_tx(registry.functions.recordSolved(i, amount, result))
+    elif intent_type == 3:
+        out = int(amount * 0.98)
+        result = json.dumps({"strategy": "DCA", "outputAmount": out})
+        send_tx(registry.functions.recordSolved(i, out, result))
+    print(f"  ✅ Solved intent #{i}")
+
+print("Done!")
